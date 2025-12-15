@@ -24,18 +24,27 @@ DEFAULT_UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-EXPECTED_FEATURES = [
-    ("Title", lambda fp: bool(fp.get("meta", {}).get("title"))),
+
+# ✅ Visible sur la page (UX / contenu)
+VISIBLE_FEATURES = [
     ("H1", lambda fp: bool(fp.get("headings", {}).get("h1"))),
     ("Header", lambda fp: bool(fp.get("modules", {}).get("header_present"))),
-    ("Breadcrumb", lambda fp: bool(fp.get("modules", {}).get("breadcrumb_present"))),
-    ("Filtres", lambda fp: bool(fp.get("modules", {}).get("filters_present"))),
-    ("Listing", lambda fp: bool(fp.get("modules", {}).get("listing_present"))),
+    ("Breadcrumb visible", lambda fp: bool(fp.get("modules", {}).get("breadcrumb_present"))),
+    ("Listing visible", lambda fp: bool(fp.get("modules", {}).get("listing_present"))),
+    ("Filtres visibles", lambda fp: bool(fp.get("modules", {}).get("filters_present"))),
+    ("Sommaire/TOC visible", lambda fp: bool(fp.get("headings", {}).get("toc_present"))),
     ("Q&A visible", lambda fp: bool(fp.get("modules", {}).get("faq_visible"))),
-    ("Schema FAQPage", lambda fp: bool(fp.get("modules", {}).get("faq_schema"))),
-    ("Contenu base", lambda fp: (fp.get("content", {}).get("word_count_est") or 0) >= 300),
+    ("Contenu éditorial base", lambda fp: (fp.get("content", {}).get("word_count_est") or 0) >= 300),
+]
+
+# ✅ Meta / SEO (non “visible” au sens UX)
+META_FEATURES = [
+    ("Title", lambda fp: bool(fp.get("meta", {}).get("title"))),
+    ("Meta description", lambda fp: bool(fp.get("meta", {}).get("meta_description"))),
     ("Canonical", lambda fp: bool(fp.get("meta", {}).get("canonical"))),
-    ("Robots meta", lambda fp: bool(fp.get("meta", {}).get("robots"))),
+    ("Schema BreadcrumbList", lambda fp: "BreadcrumbList" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
+    ("Schema ItemList", lambda fp: "ItemList" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
+    ("Schema FAQPage", lambda fp: "FAQPage" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
 ]
 
 
@@ -56,11 +65,46 @@ def domain_of(url: str) -> str:
         return ""
 
 
+def score_features(fp: dict, features: list[tuple[str, callable]]) -> tuple[list[str], list[str], str]:
+    present, missing = [], []
+    for label, fn in features:
+        ok = False
+        try:
+            ok = bool(fn(fp))
+        except Exception:
+            ok = False
+        (present if ok else missing).append(label)
+    score = f"{len(present)}/{len(present) + len(missing)}"
+    return present, missing, score
+
+
+def schema_recommendations_for_vp(fp: dict) -> list[str]:
+    """
+    Recos basées sur ce qui est visible :
+    - Breadcrumb visible -> recommander BreadcrumbList si absent
+    - Listing visible -> recommander ItemList si absent
+    - FAQ visible -> recommander FAQPage si absent
+    """
+    recos = []
+    types = fp.get("structured_data", {}).get("jsonld_types") or []
+    m = fp.get("modules", {}) or {}
+
+    if m.get("breadcrumb_present") and "BreadcrumbList" not in types:
+        recos.append("Ajouter Schema BreadcrumbList (fil d’Ariane visible)")
+
+    if m.get("listing_present") and "ItemList" not in types:
+        recos.append("Ajouter Schema ItemList (listing d’offres visible)")
+
+    if m.get("faq_visible") and "FAQPage" not in types:
+        recos.append("Ajouter Schema FAQPage (bloc Q&A visible)")
+
+    return recos
+
+
 # -----------------------------
 # SERPAPI
 # -----------------------------
 def get_serpapi_key() -> str:
-    # Streamlit secrets > env
     key = None
     try:
         key = st.secrets.get("SERPAPI_API_KEY", None)
@@ -154,13 +198,11 @@ def fetch_rendered_playwright(url: str, timeout_ms: int = 30000, headless: bool 
 
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            # Try networkidle (best effort)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass
 
-            # Basic cookie accept (best effort)
             for selector in [
                 "button#onetrust-accept-btn-handler",
                 "button:has-text('Tout accepter')",
@@ -236,6 +278,12 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     title = clean_text(soup.title.get_text()) if soup.title else None
+
+    meta_desc = None
+    md = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    if md and md.get("content"):
+        meta_desc = clean_text(md.get("content"))
+
     h1_tag = soup.find("h1")
     h1 = clean_text(h1_tag.get_text()) if h1_tag else None
 
@@ -257,9 +305,7 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
     canonical = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
     canonical_href = clean_text(canonical.get("href")) if canonical else None
 
-    robots = soup.find("meta", attrs={"name": re.compile(r"robots", re.I)})
-    robots_content = clean_text(robots.get("content")) if robots else None
-
+    # JSON-LD types
     jsonld_types: List[str] = []
     for s in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
         txt = s.get_text(strip=True)
@@ -267,18 +313,21 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
             jsonld_types += re.findall(r'"@type"\s*:\s*"([^"]+)"', txt)
     jsonld_types = sorted(set([t.strip() for t in jsonld_types if t.strip()]))
 
+    # FAQ visible (UX) + schema FAQPage (meta)
     faq_visible = bool(soup.select_one("[class*='faq' i], [id*='faq' i], details summary, [role='tablist']"))
-    faq_schema = "FAQPage" in jsonld_types
 
+    # Filtres visibles (heuristique)
     filters_present = bool(
         soup.select_one("[class*='filter' i], [id*='filter' i], [aria-label*='filtre' i], [data-testid*='filter' i]")
     )
 
+    # Listing visible (heuristique) — on évite "article" (trop bruit)
     card_candidates = soup.select(
-        "[class*='card' i], [class*='offer' i], [class*='deal' i], [class*='product' i], article"
+        "[class*='card' i], [class*='offer' i], [class*='deal' i], [class*='result' i], "
+        "[class*='product' i], [data-testid*='card' i]"
     )
     listing_count = len(card_candidates)
-    listing_present = listing_count >= 6
+    listing_present = listing_count >= 4  # seuil + “soft” (et count = estimé)
 
     # Word count (approx) – remove noisy sections
     soup2 = BeautifulSoup(html, "lxml")
@@ -292,7 +341,11 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
     return {
         "url": url,
         "domain": domain_of(url),
-        "meta": {"title": title, "robots": robots_content, "canonical": canonical_href},
+        "meta": {
+            "title": title,
+            "meta_description": meta_desc,
+            "canonical": canonical_href,
+        },
         "headings": {"h1": h1, "h2_count": len(h2s), "h2_sample": h2s[:6], "toc_present": toc_present},
         "modules": {
             "header_present": header_present,
@@ -302,7 +355,6 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
             "listing_present": listing_present,
             "listing_count_est": listing_count,
             "faq_visible": faq_visible,
-            "faq_schema": faq_schema,
         },
         "structured_data": {"jsonld_types": jsonld_types},
         "content": {"word_count_est": word_count},
@@ -310,12 +362,6 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
 
 
 def extract_fingerprint(url: str, mode: str = "hybrid") -> dict:
-    """
-    mode:
-      - "static": requests only
-      - "rendered": playwright only
-      - "hybrid": static + fallback JS if heuristics say so
-    """
     static = fetch_static(url)
     fp_static = None
     js_needed = False
@@ -355,7 +401,6 @@ def extract_fingerprint(url: str, mode: str = "hybrid") -> dict:
 
         return {"url": url, "_fetch": {"mode": "none", "error": rendered.error}}
 
-    # static only or hybrid no-js-needed
     if fp_static is None:
         fp_static = {"url": url}
     fp_static["_fetch"] = {
@@ -375,6 +420,7 @@ def extract_fingerprint(url: str, mode: str = "hybrid") -> dict:
 def format_cell_vp(fp: dict, brand: str = "Voyage Privé") -> str:
     url = fp.get("url")
     title = fp.get("meta", {}).get("title")
+    meta_desc = fp.get("meta", {}).get("meta_description")
     h1 = fp.get("headings", {}).get("h1")
     h2_count = fp.get("headings", {}).get("h2_count")
     toc = "Oui" if fp.get("headings", {}).get("toc_present") else "Non"
@@ -384,63 +430,70 @@ def format_cell_vp(fp: dict, brand: str = "Voyage Privé") -> str:
     listing_n = m.get("listing_count_est")
     filtres = "Oui" if m.get("filters_present") else "Non"
     faq = "Oui" if m.get("faq_visible") else "Non"
-    faq_schema = "Oui" if m.get("faq_schema") else "Non"
 
     wc = fp.get("content", {}).get("word_count_est")
     schema = fp.get("structured_data", {}).get("jsonld_types") or []
-    robots = fp.get("meta", {}).get("robots")
     canonical = fp.get("meta", {}).get("canonical")
 
     return "\n".join([
         f"VP : {brand}",
         f"URL : {url}",
-        f"• Title : {title}",
+        "",
+        "VISIBLE (page)",
         f"• H1 : {h1}",
-        f"• Header : {'Oui' if m.get('header_present') else 'Non'} | Nav liens : {m.get('header_links', 0)} | Breadcrumb : {'Oui' if m.get('breadcrumb_present') else 'Non'}",
+        f"• Header : {'Oui' if m.get('header_present') else 'Non'} | Breadcrumb : {'Oui' if m.get('breadcrumb_present') else 'Non'}",
         f"• Filtres : {filtres}",
-        f"• Listing (nb d'encarts) : {listing_n} | Listing : {listing}",
-        f"• Q&A : {faq} | Schema FAQPage : {faq_schema}",
-        f"• Contenu base page : {wc} mots | Sections H2 : {h2_count} | TOC : {toc}",
-        f"• Données structurées : {', '.join(schema) if schema else 'Non détecté'}",
-        f"• Indexabilité : Robots={robots or 'NC'} | Canonical={'OK' if canonical else 'KO'}",
+        f"• Listing : {listing} | Nb encarts (est.) : {listing_n}",
+        f"• Q&A visible : {faq}",
+        f"• Contenu éditorial base : {wc} mots | H2 : {h2_count} | TOC : {toc}",
+        "",
+        "META (SEO)",
+        f"• Title : {title}",
+        f"• Meta description : {meta_desc or 'NC'}",
+        f"• Canonical : {'OK' if canonical else 'KO'}",
+        f"• Données structurées (JSON-LD types) : {', '.join(schema) if schema else 'Non détecté'}",
     ])
 
 
 def format_cell_vp_presence_missing(fp: dict) -> str:
-    present, missing = [], []
-    for label, fn in EXPECTED_FEATURES:
-        ok = False
-        try:
-            ok = bool(fn(fp))
-        except Exception:
-            ok = False
-        (present if ok else missing).append(label)
+    v_present, v_missing, v_score = score_features(fp, VISIBLE_FEATURES)
+    m_present, m_missing, m_score = score_features(fp, META_FEATURES)
 
     url = fp.get("url")
     wc = fp.get("content", {}).get("word_count_est") or 0
 
     notes = []
     if wc < 300:
-        notes.append(f"Contenu base faible ({wc} mots) → compléter/structurer la partie éditoriale.")
+        notes.append(f"Contenu éditorial base faible ({wc} mots) → renforcer la partie éditoriale hors listing.")
     if fp.get("modules", {}).get("listing_present") and not fp.get("modules", {}).get("filters_present"):
-        notes.append("Listing détecté sans filtres → possiblement injecté en JS ou filtres non exposés HTML.")
+        notes.append("Listing détecté sans filtres → peut être injecté en JS, ou filtres non exposés en HTML.")
+    notes.append("Nb encarts / filtres : indicateurs 'fragiles' en multi-domaines → privilégier Oui/Non + sélecteurs par site si besoin.")
 
-    score = f"{len(present)}/{len(present)+len(missing)}"
+    recos_schema = schema_recommendations_for_vp(fp)
 
-    return "\n".join([
-        "VP — RÉCAP PRÉSENT / MANQUANT",
+    lines = [
+        "VP — RÉCAP (VISIBLE vs META)",
         f"URL : {url}",
-        f"Score complétude : {score}",
         "",
-        "✅ Présent",
-        "• " + " | ".join(present) if present else "• (aucun)",
+        f"SCORE VISIBLE : {v_score}",
+        "✅ Visible — Présent",
+        "• " + " | ".join(v_present) if v_present else "• (aucun)",
+        "❌ Visible — Manquant / Non détecté",
+        "• " + " | ".join(v_missing) if v_missing else "• (aucun)",
         "",
-        "❌ Manquant / Non détecté",
-        "• " + " | ".join(missing) if missing else "• (aucun)",
+        f"SCORE META : {m_score}",
+        "✅ Meta — Présent",
+        "• " + " | ".join(m_present) if m_present else "• (aucun)",
+        "❌ Meta — Manquant / Non détecté",
+        "• " + " | ".join(m_missing) if m_missing else "• (aucun)",
+        "",
+        "📌 Schémas recommandés (selon ce qui est visible)",
+        "• " + "\n• ".join(recos_schema) if recos_schema else "• RAS",
         "",
         "🔎 Notes",
         "• " + "\n• ".join(notes) if notes else "• RAS",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def format_cell_competitors(fps: List[dict]) -> str:
@@ -461,6 +514,7 @@ def format_cell_competitors(fps: List[dict]) -> str:
         m = fp.get("modules", {})
         wc = fp.get("content", {}).get("word_count_est")
         schema = fp.get("structured_data", {}).get("jsonld_types") or []
+        canonical = fp.get("meta", {}).get("canonical")
 
         blocks += [
             f"Domaine {i} : {dom}",
@@ -469,10 +523,11 @@ def format_cell_competitors(fps: List[dict]) -> str:
             f"• H1 : {h1}",
             f"• Header : {'Oui' if m.get('header_present') else 'Non'} | Breadcrumb : {'Oui' if m.get('breadcrumb_present') else 'Non'}",
             f"• Filtres : {'Oui' if m.get('filters_present') else 'Non'}",
-            f"• Listing (nb d'encarts) : {m.get('listing_count_est')}",
-            f"• Q&A : {'Oui' if m.get('faq_visible') else 'Non'} | Schema FAQPage : {'Oui' if m.get('faq_schema') else 'Non'}",
-            f"• Contenu base pages : {wc} mots | H2 : {fp.get('headings', {}).get('h2_count')} | TOC : {'Oui' if fp.get('headings', {}).get('toc_present') else 'Non'}",
-            f"• Données structurées : {', '.join(schema) if schema else 'Non détecté'}",
+            f"• Listing : {'Oui' if m.get('listing_present') else 'Non'} | Nb encarts (est.) : {m.get('listing_count_est')}",
+            f"• Q&A visible : {'Oui' if m.get('faq_visible') else 'Non'}",
+            f"• Contenu éditorial base : {wc} mots | TOC : {'Oui' if fp.get('headings', {}).get('toc_present') else 'Non'}",
+            f"• Canonical : {'OK' if canonical else 'KO'}",
+            f"• Données structurées (JSON-LD types) : {', '.join(schema) if schema else 'Non détecté'}",
             "",
             "---",
             "",
@@ -496,8 +551,12 @@ with st.sidebar:
     topn = st.number_input("Top N", min_value=1, max_value=20, value=10, step=1)
 
     st.header("Mode de crawl")
-    mode = st.radio("Méthode", ["hybrid", "static", "rendered"], index=0,
-                    help="hybrid = statique + fallback Playwright si page 'vide'")
+    mode = st.radio(
+        "Méthode",
+        ["hybrid", "static", "rendered"],
+        index=0,
+        help="hybrid = statique + fallback Playwright si page 'vide'",
+    )
 
 st.subheader("1) Requête & URL VP")
 q = st.text_input("Requête (mot-clé)", value="circuit autotour")
@@ -540,7 +599,7 @@ if run:
 
     fp_vp = extract_fingerprint(vp_url, mode=mode)
 
-    # Debug table
+    # Debug table (simplifiée + focus fiabilité)
     rows = []
     for fp in fps:
         rows.append({
@@ -548,10 +607,12 @@ if run:
             "url": fp.get("url"),
             "title": fp.get("meta", {}).get("title"),
             "h1": fp.get("headings", {}).get("h1"),
+            "listing_present": fp.get("modules", {}).get("listing_present"),
             "listing_count_est": fp.get("modules", {}).get("listing_count_est"),
             "filters_present": fp.get("modules", {}).get("filters_present"),
-            "faq_schema": fp.get("modules", {}).get("faq_schema"),
+            "faq_visible": fp.get("modules", {}).get("faq_visible"),
             "word_count_est": fp.get("content", {}).get("word_count_est"),
+            "schema_types": ", ".join(fp.get("structured_data", {}).get("jsonld_types") or []),
             "fetch_mode": fp.get("_fetch", {}).get("mode"),
             "js_reasons": ",".join(fp.get("_fetch", {}).get("js_decision", {}).get("reasons", [])),
             "fetch_error": fp.get("_fetch", {}).get("error"),
@@ -577,6 +638,6 @@ if run:
     c1, c2 = st.columns(2)
     with c1:
         st.text_area("Cellule CONCURRENTS", value=cell_comp, height=420)
-        st.text_area("Cellule VP", value=cell_vp, height=420)
+        st.text_area("Cellule VP", value=cell_vp, height=520)
     with c2:
-        st.text_area("Cellule VP — Présent/Manquant", value=cell_vp_pm, height=520)
+        st.text_area("Cellule VP — Récap (Visible vs Meta)", value=cell_vp_pm, height=720)
