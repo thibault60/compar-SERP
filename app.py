@@ -13,9 +13,9 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-# -----------------------------
-# CONFIG / CONSTANTS
-# -----------------------------
+# =========================================================
+# CONFIG
+# =========================================================
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 DEFAULT_UA = (
@@ -24,33 +24,28 @@ DEFAULT_UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-
-# ✅ Visible sur la page (UX / contenu)
+# Critères "client-facing" — focus sur les MANQUANTS
 VISIBLE_FEATURES = [
     ("H1", lambda fp: bool(fp.get("headings", {}).get("h1"))),
-    ("Header", lambda fp: bool(fp.get("modules", {}).get("header_present"))),
-    ("Breadcrumb visible", lambda fp: bool(fp.get("modules", {}).get("breadcrumb_present"))),
-    ("Listing visible", lambda fp: bool(fp.get("modules", {}).get("listing_present"))),
     ("Filtres visibles", lambda fp: bool(fp.get("modules", {}).get("filters_present"))),
-    ("Sommaire/TOC visible", lambda fp: bool(fp.get("headings", {}).get("toc_present"))),
-    ("Q&A visible", lambda fp: bool(fp.get("modules", {}).get("faq_visible"))),
-    ("Contenu éditorial base", lambda fp: (fp.get("content", {}).get("word_count_est") or 0) >= 300),
+    ("Avis", lambda fp: bool(fp.get("modules", {}).get("reviews_present"))),
+    ("Q&A", lambda fp: bool(fp.get("modules", {}).get("faq_visible"))),
+    ("Encart Contact", lambda fp: bool(fp.get("modules", {}).get("contact_present"))),
+    ("Articles", lambda fp: bool(fp.get("modules", {}).get("articles_present"))),
 ]
 
-# ✅ Meta / SEO (non “visible” au sens UX)
 META_FEATURES = [
-    ("Title", lambda fp: bool(fp.get("meta", {}).get("title"))),
-    ("Meta description", lambda fp: bool(fp.get("meta", {}).get("meta_description"))),
-    ("Canonical", lambda fp: bool(fp.get("meta", {}).get("canonical"))),
-    ("Schema BreadcrumbList", lambda fp: "BreadcrumbList" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
     ("Schema ItemList", lambda fp: "ItemList" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
     ("Schema FAQPage", lambda fp: "FAQPage" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
+    ("Schema TravelAgency", lambda fp: "TravelAgency" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
+    ("Schema ListItem", lambda fp: "ListItem" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
+    ("Schema AggregateRating", lambda fp: "AggregateRating" in (fp.get("structured_data", {}).get("jsonld_types") or [])),
 ]
 
 
-# -----------------------------
+# =========================================================
 # UTILS
-# -----------------------------
+# =========================================================
 def clean_text(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
@@ -65,7 +60,7 @@ def domain_of(url: str) -> str:
         return ""
 
 
-def score_features(fp: dict, features: list[tuple[str, callable]]) -> tuple[list[str], list[str], str]:
+def score_features(fp: dict, features: list[tuple[str, callable]]) -> tuple[list[str], list[str]]:
     present, missing = [], []
     for label, fn in features:
         ok = False
@@ -74,36 +69,12 @@ def score_features(fp: dict, features: list[tuple[str, callable]]) -> tuple[list
         except Exception:
             ok = False
         (present if ok else missing).append(label)
-    score = f"{len(present)}/{len(present) + len(missing)}"
-    return present, missing, score
+    return present, missing
 
 
-def schema_recommendations_for_vp(fp: dict) -> list[str]:
-    """
-    Recos basées sur ce qui est visible :
-    - Breadcrumb visible -> recommander BreadcrumbList si absent
-    - Listing visible -> recommander ItemList si absent
-    - FAQ visible -> recommander FAQPage si absent
-    """
-    recos = []
-    types = fp.get("structured_data", {}).get("jsonld_types") or []
-    m = fp.get("modules", {}) or {}
-
-    if m.get("breadcrumb_present") and "BreadcrumbList" not in types:
-        recos.append("Ajouter Schema BreadcrumbList (fil d’Ariane visible)")
-
-    if m.get("listing_present") and "ItemList" not in types:
-        recos.append("Ajouter Schema ItemList (listing d’offres visible)")
-
-    if m.get("faq_visible") and "FAQPage" not in types:
-        recos.append("Ajouter Schema FAQPage (bloc Q&A visible)")
-
-    return recos
-
-
-# -----------------------------
+# =========================================================
 # SERPAPI
-# -----------------------------
+# =========================================================
 def get_serpapi_key() -> str:
     key = None
     try:
@@ -139,9 +110,9 @@ def serpapi_google_search(q: str, gl: str, hl: str, num: int, location: Optional
     return data
 
 
-# -----------------------------
+# =========================================================
 # FETCHERS
-# -----------------------------
+# =========================================================
 @dataclass
 class FetchResult:
     url: str
@@ -198,11 +169,13 @@ def fetch_rendered_playwright(url: str, timeout_ms: int = 30000, headless: bool 
 
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
+            # Best effort : stabilisation
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass
 
+            # Best effort : cookies
             for selector in [
                 "button#onetrust-accept-btn-handler",
                 "button:has-text('Tout accepter')",
@@ -245,9 +218,9 @@ def fetch_rendered_playwright(url: str, timeout_ms: int = 30000, headless: bool 
         )
 
 
-# -----------------------------
+# =========================================================
 # DETECTOR (need JS?)
-# -----------------------------
+# =========================================================
 def needs_js(html: Optional[str]) -> tuple[bool, List[str]]:
     reasons: List[str] = []
     if not html or len(html) < 2000:
@@ -271,12 +244,13 @@ def needs_js(html: Optional[str]) -> tuple[bool, List[str]]:
     return (len(reasons) >= 2), reasons
 
 
-# -----------------------------
+# =========================================================
 # EXTRACTOR (fingerprint)
-# -----------------------------
+# =========================================================
 def extract_fingerprint_from_html(url: str, html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
+    # --- Meta
     title = clean_text(soup.title.get_text()) if soup.title else None
 
     meta_desc = None
@@ -284,28 +258,76 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
     if md and md.get("content"):
         meta_desc = clean_text(md.get("content"))
 
+    canonical = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+    canonical_href = clean_text(canonical.get("href")) if canonical else None
+
+    # --- Headings
     h1_tag = soup.find("h1")
     h1 = clean_text(h1_tag.get_text()) if h1_tag else None
-
-    h2s = [clean_text(h.get_text()) for h in soup.find_all("h2")]
-    h2s = [x for x in h2s if x]
-
-    header = soup.find("header")
-    header_present = bool(header)
-    header_links = len(header.find_all("a")) if header else 0
-
-    breadcrumb_present = bool(
-        soup.select_one("[aria-label*='breadcrumb' i], nav.breadcrumb, .breadcrumb, [class*='breadcrumb']")
-    )
 
     toc_present = bool(
         soup.select_one("[id*='toc' i], [class*='toc' i], [class*='sommaire' i]")
     )
 
-    canonical = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
-    canonical_href = clean_text(canonical.get("href")) if canonical else None
+    # --- Modules (visible)
+    header = soup.find("header")
+    header_present = bool(header)
 
-    # JSON-LD types
+    breadcrumb_present = bool(
+        soup.select_one("[aria-label*='breadcrumb' i], nav.breadcrumb, .breadcrumb, [class*='breadcrumb']")
+    )
+
+    filters_present = bool(
+        soup.select_one("[class*='filter' i], [id*='filter' i], [aria-label*='filtre' i], [data-testid*='filter' i]")
+    )
+
+    # Listing visible (heuristique) — count = estimé
+    card_candidates = soup.select(
+        "[class*='card' i], [class*='offer' i], [class*='deal' i], [class*='result' i], "
+        "[class*='product' i], [data-testid*='card' i]"
+    )
+    listing_count = len(card_candidates)
+    listing_present = listing_count >= 4
+
+    faq_visible = bool(soup.select_one("[class*='faq' i], [id*='faq' i], details summary, [role='tablist']"))
+
+    # --- Heuristiques supplémentaires demandées (Avis / Contact / Articles)
+    page_text = soup.get_text(" ", strip=True)
+    page_text_lower = page_text.lower()
+
+    reviews_present = bool(
+        soup.select_one(
+            "[class*='review' i], [class*='rating' i], [class*='star' i], "
+            "[id*='review' i], [id*='rating' i], [data-testid*='rating' i]"
+        )
+        or (" avis" in page_text_lower)
+        or ("trustpilot" in page_text_lower)
+        or ("★" in page_text)  # étoile brute
+        or ("/5" in page_text_lower and "note" in page_text_lower)
+    )
+
+    contact_present = bool(
+        soup.select_one("a[href^='tel:'], a[href*='contact' i], [class*='contact' i], [id*='contact' i]")
+        or ("nous contacter" in page_text_lower)
+        or ("service client" in page_text_lower)
+        or ("contact" in page_text_lower)
+        or ("chat" in page_text_lower)
+    )
+
+    articles_present = bool(
+        soup.select_one(
+            "[class*='article' i], [id*='article' i], [class*='blog' i], [class*='magazine' i], "
+            "[class*='inspiration' i]"
+        )
+        or soup.select_one(
+            "a[href*='/blog' i], a[href*='/magazine' i], a[href*='inspiration' i], a[href*='conseil' i]"
+        )
+        or ("articles" in page_text_lower)
+        or ("inspiration" in page_text_lower)
+        or ("nos conseils" in page_text_lower)
+    )
+
+    # --- Structured data (JSON-LD types)
     jsonld_types: List[str] = []
     for s in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
         txt = s.get_text(strip=True)
@@ -313,30 +335,13 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
             jsonld_types += re.findall(r'"@type"\s*:\s*"([^"]+)"', txt)
     jsonld_types = sorted(set([t.strip() for t in jsonld_types if t.strip()]))
 
-    # FAQ visible (UX) + schema FAQPage (meta)
-    faq_visible = bool(soup.select_one("[class*='faq' i], [id*='faq' i], details summary, [role='tablist']"))
-
-    # Filtres visibles (heuristique)
-    filters_present = bool(
-        soup.select_one("[class*='filter' i], [id*='filter' i], [aria-label*='filtre' i], [data-testid*='filter' i]")
-    )
-
-    # Listing visible (heuristique) — on évite "article" (trop bruit)
-    card_candidates = soup.select(
-        "[class*='card' i], [class*='offer' i], [class*='deal' i], [class*='result' i], "
-        "[class*='product' i], [data-testid*='card' i]"
-    )
-    listing_count = len(card_candidates)
-    listing_present = listing_count >= 4  # seuil + “soft” (et count = estimé)
-
-    # Word count (approx) – remove noisy sections
+    # --- Content stats (très approximatif)
     soup2 = BeautifulSoup(html, "lxml")
     for tag in soup2(["script", "style", "noscript"]):
         tag.decompose()
     for tag in soup2.select("nav, footer"):
         tag.decompose()
-    text = soup2.get_text(" ", strip=True)
-    word_count = len(text.split())
+    word_count = len(soup2.get_text(" ", strip=True).split())
 
     return {
         "url": url,
@@ -346,15 +351,20 @@ def extract_fingerprint_from_html(url: str, html: str) -> dict:
             "meta_description": meta_desc,
             "canonical": canonical_href,
         },
-        "headings": {"h1": h1, "h2_count": len(h2s), "h2_sample": h2s[:6], "toc_present": toc_present},
+        "headings": {
+            "h1": h1,
+            "toc_present": toc_present,
+        },
         "modules": {
             "header_present": header_present,
-            "header_links": header_links,
             "breadcrumb_present": breadcrumb_present,
             "filters_present": filters_present,
             "listing_present": listing_present,
             "listing_count_est": listing_count,
             "faq_visible": faq_visible,
+            "reviews_present": reviews_present,
+            "contact_present": contact_present,
+            "articles_present": articles_present,
         },
         "structured_data": {"jsonld_types": jsonld_types},
         "content": {"word_count_est": word_count},
@@ -414,88 +424,9 @@ def extract_fingerprint(url: str, mode: str = "hybrid") -> dict:
     return fp_static
 
 
-# -----------------------------
+# =========================================================
 # FORMATTERS (Excel cells)
-# -----------------------------
-def format_cell_vp(fp: dict, brand: str = "Voyage Privé") -> str:
-    url = fp.get("url")
-    title = fp.get("meta", {}).get("title")
-    meta_desc = fp.get("meta", {}).get("meta_description")
-    h1 = fp.get("headings", {}).get("h1")
-    h2_count = fp.get("headings", {}).get("h2_count")
-    toc = "Oui" if fp.get("headings", {}).get("toc_present") else "Non"
-
-    m = fp.get("modules", {})
-    listing = "Oui" if m.get("listing_present") else "Non"
-    listing_n = m.get("listing_count_est")
-    filtres = "Oui" if m.get("filters_present") else "Non"
-    faq = "Oui" if m.get("faq_visible") else "Non"
-
-    wc = fp.get("content", {}).get("word_count_est")
-    schema = fp.get("structured_data", {}).get("jsonld_types") or []
-    canonical = fp.get("meta", {}).get("canonical")
-
-    return "\n".join([
-        f"VP : {brand}",
-        f"URL : {url}",
-        "",
-        "VISIBLE (page)",
-        f"• H1 : {h1}",
-        f"• Header : {'Oui' if m.get('header_present') else 'Non'} | Breadcrumb : {'Oui' if m.get('breadcrumb_present') else 'Non'}",
-        f"• Filtres : {filtres}",
-        f"• Listing : {listing} | Nb encarts (est.) : {listing_n}",
-        f"• Q&A visible : {faq}",
-        f"• Contenu éditorial base : {wc} mots | H2 : {h2_count} | TOC : {toc}",
-        "",
-        "META (SEO)",
-        f"• Title : {title}",
-        f"• Meta description : {meta_desc or 'NC'}",
-        f"• Canonical : {'OK' if canonical else 'KO'}",
-        f"• Données structurées (JSON-LD types) : {', '.join(schema) if schema else 'Non détecté'}",
-    ])
-
-
-def format_cell_vp_presence_missing(fp: dict) -> str:
-    v_present, v_missing, v_score = score_features(fp, VISIBLE_FEATURES)
-    m_present, m_missing, m_score = score_features(fp, META_FEATURES)
-
-    url = fp.get("url")
-    wc = fp.get("content", {}).get("word_count_est") or 0
-
-    notes = []
-    if wc < 300:
-        notes.append(f"Contenu éditorial base faible ({wc} mots) → renforcer la partie éditoriale hors listing.")
-    if fp.get("modules", {}).get("listing_present") and not fp.get("modules", {}).get("filters_present"):
-        notes.append("Listing détecté sans filtres → peut être injecté en JS, ou filtres non exposés en HTML.")
-    notes.append("Nb encarts / filtres : indicateurs 'fragiles' en multi-domaines → privilégier Oui/Non + sélecteurs par site si besoin.")
-
-    recos_schema = schema_recommendations_for_vp(fp)
-
-    lines = [
-        "VP — RÉCAP (VISIBLE vs META)",
-        f"URL : {url}",
-        "",
-        f"SCORE VISIBLE : {v_score}",
-        "✅ Visible — Présent",
-        "• " + " | ".join(v_present) if v_present else "• (aucun)",
-        "❌ Visible — Manquant / Non détecté",
-        "• " + " | ".join(v_missing) if v_missing else "• (aucun)",
-        "",
-        f"SCORE META : {m_score}",
-        "✅ Meta — Présent",
-        "• " + " | ".join(m_present) if m_present else "• (aucun)",
-        "❌ Meta — Manquant / Non détecté",
-        "• " + " | ".join(m_missing) if m_missing else "• (aucun)",
-        "",
-        "📌 Schémas recommandés (selon ce qui est visible)",
-        "• " + "\n• ".join(recos_schema) if recos_schema else "• RAS",
-        "",
-        "🔎 Notes",
-        "• " + "\n• ".join(notes) if notes else "• RAS",
-    ]
-    return "\n".join(lines)
-
-
+# =========================================================
 def format_cell_competitors(fps: List[dict]) -> str:
     seen = set()
     blocks = ["CONCURRENTS (Top SERP)", ""]
@@ -512,7 +443,6 @@ def format_cell_competitors(fps: List[dict]) -> str:
         title = fp.get("meta", {}).get("title")
         h1 = fp.get("headings", {}).get("h1")
         m = fp.get("modules", {})
-        wc = fp.get("content", {}).get("word_count_est")
         schema = fp.get("structured_data", {}).get("jsonld_types") or []
         canonical = fp.get("meta", {}).get("canonical")
 
@@ -521,11 +451,13 @@ def format_cell_competitors(fps: List[dict]) -> str:
             f"URL : {url}",
             f"• Title : {title}",
             f"• H1 : {h1}",
-            f"• Header : {'Oui' if m.get('header_present') else 'Non'} | Breadcrumb : {'Oui' if m.get('breadcrumb_present') else 'Non'}",
-            f"• Filtres : {'Oui' if m.get('filters_present') else 'Non'}",
+            f"• Breadcrumb : {'Oui' if m.get('breadcrumb_present') else 'Non'}",
             f"• Listing : {'Oui' if m.get('listing_present') else 'Non'} | Nb encarts (est.) : {m.get('listing_count_est')}",
-            f"• Q&A visible : {'Oui' if m.get('faq_visible') else 'Non'}",
-            f"• Contenu éditorial base : {wc} mots | TOC : {'Oui' if fp.get('headings', {}).get('toc_present') else 'Non'}",
+            f"• Filtres : {'Oui' if m.get('filters_present') else 'Non'}",
+            f"• Q&A : {'Oui' if m.get('faq_visible') else 'Non'}",
+            f"• Avis : {'Oui' if m.get('reviews_present') else 'Non'}",
+            f"• Contact : {'Oui' if m.get('contact_present') else 'Non'}",
+            f"• Articles : {'Oui' if m.get('articles_present') else 'Non'}",
             f"• Canonical : {'OK' if canonical else 'KO'}",
             f"• Données structurées (JSON-LD types) : {', '.join(schema) if schema else 'Non détecté'}",
             "",
@@ -536,9 +468,58 @@ def format_cell_competitors(fps: List[dict]) -> str:
     return "\n".join(blocks).strip()
 
 
-# -----------------------------
+def format_cell_vp(fp: dict, brand: str = "Voyage Privé") -> str:
+    url = fp.get("url")
+    title = fp.get("meta", {}).get("title")
+    meta_desc = fp.get("meta", {}).get("meta_description")
+    canonical = fp.get("meta", {}).get("canonical")
+    schema = fp.get("structured_data", {}).get("jsonld_types") or []
+    m = fp.get("modules", {})
+    h1 = fp.get("headings", {}).get("h1")
+
+    return "\n".join([
+        f"VP : {brand}",
+        f"URL : {url}",
+        f"• Title : {title}",
+        f"• Meta description : {meta_desc or 'NC'}",
+        f"• Canonical : {'OK' if canonical else 'KO'}",
+        f"• H1 : {h1}",
+        f"• Listing : {'Oui' if m.get('listing_present') else 'Non'} | Nb encarts (est.) : {m.get('listing_count_est')}",
+        f"• Filtres : {'Oui' if m.get('filters_present') else 'Non'}",
+        f"• Q&A : {'Oui' if m.get('faq_visible') else 'Non'}",
+        f"• Avis : {'Oui' if m.get('reviews_present') else 'Non'}",
+        f"• Contact : {'Oui' if m.get('contact_present') else 'Non'}",
+        f"• Articles : {'Oui' if m.get('articles_present') else 'Non'}",
+        f"• Données structurées (JSON-LD types) : {', '.join(schema) if schema else 'Non détecté'}",
+    ])
+
+
+def format_cell_vp_missing_only(fp: dict) -> str:
+    _, v_missing = score_features(fp, VISIBLE_FEATURES)
+    _, m_missing = score_features(fp, META_FEATURES)
+
+    url = fp.get("url")
+    notes = []
+    if fp.get("modules", {}).get("listing_present") and not fp.get("modules", {}).get("filters_present"):
+        notes.append("Listing détecté sans filtres → peut être injecté en JS, ou filtres non exposés en HTML.")
+
+    return "\n".join([
+        f"URL : {url}",
+        "",
+        "❌ Visible — Manquant / Non détecté",
+        "• " + " | ".join(v_missing) if v_missing else "• RAS",
+        "",
+        "❌ Meta — Manquant / Non détecté",
+        "• " + " | ".join(m_missing) if m_missing else "• RAS",
+        "",
+        "🔎 Notes",
+        "• " + "\n• ".join(notes) if notes else "• RAS",
+    ])
+
+
+# =========================================================
 # STREAMLIT UI
-# -----------------------------
+# =========================================================
 st.set_page_config(page_title="SERP → Empreintes SEO (1 fichier)", layout="wide")
 st.title("SERP → Empreintes SEO (1 fichier) — SerpApi + Hybrid fetch")
 
@@ -590,6 +571,7 @@ if run:
 
     st.write(f"URLs SERP récupérées : **{len(serp_urls)}**")
 
+    # Fingerprints concurrents
     fps = []
     prog = st.progress(0)
     for i, url in enumerate(serp_urls, start=1):
@@ -597,9 +579,10 @@ if run:
         fps.append(fp)
         prog.progress(int(i / max(1, len(serp_urls)) * 100))
 
+    # Fingerprint VP
     fp_vp = extract_fingerprint(vp_url, mode=mode)
 
-    # Debug table (simplifiée + focus fiabilité)
+    # Debug table (utile pour vérifier les heuristiques)
     rows = []
     for fp in fps:
         rows.append({
@@ -611,7 +594,9 @@ if run:
             "listing_count_est": fp.get("modules", {}).get("listing_count_est"),
             "filters_present": fp.get("modules", {}).get("filters_present"),
             "faq_visible": fp.get("modules", {}).get("faq_visible"),
-            "word_count_est": fp.get("content", {}).get("word_count_est"),
+            "reviews_present": fp.get("modules", {}).get("reviews_present"),
+            "contact_present": fp.get("modules", {}).get("contact_present"),
+            "articles_present": fp.get("modules", {}).get("articles_present"),
             "schema_types": ", ".join(fp.get("structured_data", {}).get("jsonld_types") or []),
             "fetch_mode": fp.get("_fetch", {}).get("mode"),
             "js_reasons": ",".join(fp.get("_fetch", {}).get("js_decision", {}).get("reasons", [])),
@@ -629,15 +614,15 @@ if run:
         mime="text/csv",
     )
 
-    # Excel cells
+    # Sorties Excel
     st.subheader("3) Sorties Excel (copier-coller)")
     cell_comp = format_cell_competitors(fps)
     cell_vp = format_cell_vp(fp_vp)
-    cell_vp_pm = format_cell_vp_presence_missing(fp_vp)
+    cell_vp_missing = format_cell_vp_missing_only(fp_vp)
 
     c1, c2 = st.columns(2)
     with c1:
-        st.text_area("Cellule CONCURRENTS", value=cell_comp, height=420)
-        st.text_area("Cellule VP", value=cell_vp, height=520)
+        st.text_area("Cellule CONCURRENTS", value=cell_comp, height=520)
+        st.text_area("Cellule VP", value=cell_vp, height=420)
     with c2:
-        st.text_area("Cellule VP — Récap (Visible vs Meta)", value=cell_vp_pm, height=720)
+        st.text_area("Cellule VP — Réca​p (Manquants)", value=cell_vp_missing, height=420)
